@@ -8,14 +8,18 @@
     "total_interactions": 0
   },
   "profile": {
-    "name": null,
-    "business_name": null,
-    "role_or_title": null,
-    "industry": null,
-    "key_objectives": []
+    "name": "Pat Shanks",
+    "business_name": "Pat and Lorna",
+    "role_or_title": "Business Operator",
+    "industry": "Entrepreneurship",
+    "key_objectives": [
+      "Business operations management",
+      "Content creation and strategy",
+      "Team collaboration"
+    ]
   },
   "preferences": {
-    "communication_style": null,
+    "communication_style": "Direct and action-oriented",
     "preferred_tools": [],
     "decision_making_style": null,
     "notification_preferences": {},
@@ -65,4 +69,4 @@
     "learning_log": []
   },
   "custom_memory": {}
-} 
+}
