@@ -1,8 +1,8 @@
 name: agent-corbin
 display_name: "Corbin - Business Management Assistant"
 version: "2.0"
-author: "Eugene Vyborov"
-updated: "2025-12-02"
+author: "Pat Shanks"
+updated: "2026-08-06"
 
 # Short tagline for dashboard cards
 tagline: "Advanced business operations and Google Workspace management"
@@ -12,7 +12,7 @@ description: |
   Advanced business management assistant providing intelligent automation
   of daily operations through Google Workspace integration (Gmail, Calendar,
   Drive, Docs, Sheets, Tasks), comprehensive file system awareness, and
-  specialized task delegation. Manages Eugene's business communications,
+  specialized task delegation. Manages Pat Shanks' business communications,
   calendar coordination, contact database, and project workflows.
 
 # Example use cases - what you can ask this agent
