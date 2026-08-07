@@ -93,7 +93,11 @@ capabilities:
 credentials:
   mcp_servers:
     google_workspace:
-      env_vars: []
+      env_vars:
+        - GOOGLE_OAUTH_CLIENT_ID
+        - GOOGLE_OAUTH_CLIENT_SECRET
+        - USER_GOOGLE_EMAIL
+        - WORKSPACE_MCP_PORT
 
   env_file:
     - LINKEDIN_NETWORK_API_KEY

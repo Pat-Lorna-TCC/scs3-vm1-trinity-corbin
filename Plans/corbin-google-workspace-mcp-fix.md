@@ -1,0 +1,100 @@
+# Fix Google Workspace MCP for Corbin
+
+**Goal:** get `mcp__google_workspace__*` tools (Gmail, Calendar, Drive, Docs, Sheets, Tasks) actually working for the `agent-corbin` template / `trinity-corbin` deployment, without breaking any existing tool references in CLAUDE.md or subagents.
+
+**Repo:** `/home/pshanks/projects/trinity-corbin`. `origin` is `git@github.com:Pat-Lorna-TCC/scs3-vm1-trinity-corbin.git` — its own independent repo, not a GitHub-native fork. `upstream` (`https://github.com/Abilityai/agent-corbin.git`) is added as a plain remote so template updates can be pulled in, but there's no fork relationship on GitHub's side.
+
+---
+
+## Root cause
+
+`.mcp.json.template` (and the generated `.mcp.json`) point at `npx @modelcontextprotocol/server-google-workspace@0.1.2` — **this package does not exist** (404 on the npm registry, reconfirmed 2026-08-07). Confirmed via the MCP connection log (`~/.cache/claude-cli-nodejs/-home-pshanks-projects-trinity-corbin/mcp-logs-google-workspace/*.jsonl`: `npm error 404 ... could not be found`).
+
+This isn't a regression — `git log --follow -- .mcp.json.template` shows the fabricated package name has been there since the **very first commit** of the template (2025-12-11, "Initial commit - Corbin business operations agent"). It has never worked. `template.yaml`'s credential schema for this server was also left empty (`credentials.mcp_servers.google_workspace.env_vars: []`), so Trinity's credential injection was never wired to feed it anything either.
+
+## Options investigated and ruled out
+
+- **Google's own official remote MCP servers** (`gmailmcp.googleapis.com`, etc.) — real and verified live, but still Developer Preview, no Tasks support, and no headless/non-interactive auth path that reaches Trinity's headless `claude -p` + project-level `.mcp.json` invocation. See prior investigation notes below for the full page-by-page trail.
+- **`nityeshaga/google-workspace-mcp-server`** (npm, verified real) — accepts `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`GOOGLE_REFRESH_TOKEN` directly, but its tool names (`gmail_list_messages`, `calendar_list_events`, ...) don't match CLAUDE.md or the subagents, and it has **no Google Tasks support** — CLAUDE.md calls Tasks the "PRIMARY TASK MANAGEMENT SYSTEM."
+- **Trinity's platform Credentials-tab OAuth ("Connect Google" button)** — investigated in depth on 2026-08-07 and confirmed **non-functional for Google**, not just limited:
+  - `src/backend/routers/credentials.py` has `POST /oauth/{provider}/init` (builds a Google auth URL) but **no `/oauth/{provider}/callback` route exists anywhere in the backend** for Google. Only Slack has a real implemented callback (`slack_oauth_callback` in `routers/slack.py`). If you completed Google's consent screen right now, it would redirect to a 404.
+  - The current `CredentialsPanel.vue` (the real Credentials tab UI) has **no OAuth provider buttons at all** — checked every button label.
+  - Two internal design docs describe building this feature (`docs/development/GOOGLE_DRIVE_OAUTH_INTEGRATION.md`, a 2025-12-01 requirements doc for the old Redis-based credential system; and `docs/user-docs/credentials/oauth-credentials.md`, describing the intended CRED-002 behavior) — neither was ever finished for Google. The Redis system the first doc was written against was fully removed in the CRED-002 refactor (2026-02-05), and OAuth was never rebuilt on the new file-injection system.
+  - Even if it worked, the route only requests `openid email profile drive` scope for Google — no Gmail, Calendar, or Tasks scope, so it wouldn't cover what CLAUDE.md needs regardless.
+  - (The original version of this plan rejected this path for a different, now-superseded reason — "credentials only inject at agent creation time." That claim is also outdated: `docs/memory/feature-flows/credential-injection.md` confirms the current CRED-002 system explicitly injects credentials *after* creation via Quick Inject / `.credentials.enc`, not at creation. Moot either way, since the flow doesn't work for Google at all right now.)
+- **Service-account domain-wide delegation** (the previous version of this plan's chosen path) — technically valid (Pat administers the `patandlorna@patandlorna.com` domain, so it's available), but superseded by the option below once it became clear Pat already holds a working OAuth client that fits the repo's existing tooling more directly. Kept as a fallback — see "Alternatives not taken" at the end.
+
+## Decision: `taylorwilsdon/workspace-mcp` + user OAuth ("Confidential Client" mode), using the OAuth client Pat already created
+
+Pat created a standard OAuth 2.0 client in Google Cloud Console (`GOOGLE_CLIENT_ID` ending `.apps.googleusercontent.com`, `GOOGLE_CLIENT_SECRET` prefixed `GOCSPX-`, currently sitting in `trinity/.env` at lines 123-124, following the pattern in Trinity's own `.env.example`). That's a real, usable credential — it just doesn't have a working consumer inside Trinity's platform (see above). `workspace-mcp` (PyPI, current version 1.23.1 as of 2026-08-07) has a mode built for exactly this: **bring your own OAuth client, do a one-time interactive browser consent, cache the resulting token to disk.** No Trinity platform changes needed — the client lives in Corbin's own `.env`/`.mcp.json`, same as `APOLLO_API_KEY` already does.
+
+**This also matches tooling already in this repo.** CLAUDE.md's existing "Google Workspace Re-Authentication" section (`scripts/utilities/google_auth.html`, a `localhost:8888` redirect, "update the authorization URL and have the user click through") describes exactly this interactive-consent pattern. The previous version of this plan planned to delete that section as obsolete, on the assumption the fix would be service-account auth (which has no expiring tokens and nothing to re-authenticate). That assumption was wrong — the re-auth tooling is evidence the template's original author already anticipated the OAuth-client + interactive-consent flow. **Keep that section; it's load-bearing, not legacy cruft.**
+
+Confirmed from `workspace-mcp`'s README (PyPI long description) **and, as of 2026-08-07, from the actual package source** (downloaded and inspected the 1.23.1 wheel directly — `main.py`, `core/config.py`, `auth/oauth_config.py`, `core/tool_tiers.yaml`, `gcalendar/calendar_tools.py`, `gtasks/tasks_tools.py`):
+- Supports all twelve Google Workspace services including Tasks (6 tools) and Gmail (15 tools, including send).
+- **Tool names mostly match CLAUDE.md and the subagents, but not entirely — one real gap found:** the `google-workspace` subagent (`.claude/agents/google-workspace.md` line 4) declares `mcp__google_workspace__create_event`, `modify_event`, `create_task`, and `update_task` as separate tools. In the actual package these are internal helper functions (`_create_event_impl`, `_modify_event_impl`, `_create_task_impl`, `_update_task_impl`) consolidated behind two single public tools, `manage_event` and `manage_task` (each takes an `action` parameter). Confirmed against `core/tool_tiers.yaml`'s `calendar`/`tasks` tiers and the actual `async def` names in the source — no separate `create_event`/`modify_event`/`create_task`/`update_task` tools exist. **This subagent's tool list needs a one-line fix in Phase 2** (see below). No other subagent or CLAUDE.md itself references these names (checked via grep across `.claude/agents/*.md` and `CLAUDE.md`).
+- "Confidential Client" mode env vars: `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` (**note the `OAUTH` infix — different names than the `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` Pat's values sat under in `trinity/.env`; already copied over under the new names into `trinity-corbin`'s own `.env` — see Phase 1 step 4**).
+- Google Cloud Console OAuth client type: the quick-start guide recommends **Desktop application** for local/stdio setups ("no redirect URIs to manage"). Pat's client was created following Trinity's own `GOOGLE_OAUTH_SETUP.md`, which specifies **Web application** with a Trinity-specific redirect URI. A Web application client can still work — Google allows multiple registered redirect URIs on one client — the redirect URI `workspace-mcp` needs (`http://localhost:8888/oauth2callback` — see Phase 1 step 3) just needs adding to that same client in Cloud Console alongside Trinity's existing one.
+- **Redirect URI/port confirmed from source** (`auth/oauth_config.py`): defaults to `{WORKSPACE_MCP_BASE_URI}:{port}/oauth2callback`, port defaults to `8000` (via `WORKSPACE_MCP_PORT`/`PORT` env vars), fully overridable via `GOOGLE_OAUTH_REDIRECT_URI`. Set to port `8888` for this deployment to avoid colliding with Trinity's own `localhost:8000` OAuth callback — see Phase 1 step 3.
+- Service-account domain-wide delegation is a **fully separate, mutually-exclusive auth mode** (`--single-user` legacy OAuth vs. service-account vs. OAuth 2.1 multi-user) — confirmed via workspacemcp.com/docs and `main.py`'s mode-conflict checks. No risk of the two modes interfering with each other if this path is ever revisited later.
+- Tokens cache to disk (encrypted, per the `workspace-cli` docs: "authenticate once, script forever") — survives container restarts, consistent with CLAUDE.md's existing re-auth flow only needing to run when a token actually expires/gets revoked, not on every restart.
+
+Env vars this mode needs — **all set in `trinity-corbin/.env` as of 2026-08-07** (Phase 1 step 4):
+- `GOOGLE_OAUTH_CLIENT_ID` — copied from `trinity/.env`'s `GOOGLE_CLIENT_ID` value.
+- `GOOGLE_OAUTH_CLIENT_SECRET` — copied from `trinity/.env`'s `GOOGLE_CLIENT_SECRET` value.
+- `USER_GOOGLE_EMAIL=patandlorna@patandlorna.com` — default mailbox (workspace-mcp also accepts this per-tool-call).
+- `WORKSPACE_MCP_PORT=8888` — avoids the port-8000 collision with Trinity's own OAuth callback.
+
+---
+
+## Phase 1 — Google Cloud Console verification (run by Pat)
+
+Lighter than the original plan's service-account phase — the OAuth client already exists.
+
+1. ~~Confirm the following APIs are enabled~~ — **done 2026-08-07.** Pat installed and authenticated `gcloud` (`patandlorna@patandlorna.com`, project `scs3-vm1-trinity`, project number `878904064062` — confirmed matching the prefix of the existing OAuth Client ID). Checked via `gcloud services list --enabled`: Gmail, Calendar, Drive, Docs, and Sheets were already enabled; Tasks and Chat were missing and have now been enabled via `gcloud services enable tasks.googleapis.com chat.googleapis.com --project=scs3-vm1-trinity`, verified active. All seven APIs confirmed enabled.
+   - Side finding, not blocking: this project also already has Google's own official Workspace MCP APIs enabled (`gmailmcp.googleapis.com`, `docsmcp.googleapis.com`, `drivemcp.googleapis.com`, `workspacemcp.googleapis.com`) — the ones this plan's "Options investigated and ruled out" section already covers (Developer Preview, no Tasks support, no headless auth path). Someone tried that path at some point; doesn't conflict with anything here.
+2. ~~Confirm the OAuth consent screen has the scopes CLAUDE.md needs~~ — **done 2026-08-07.** Added `gmail.modify`, `calendar`, `drive`, `documents`, `spreadsheets`, `tasks`, `chat.messages` to the consent screen's Data Access scopes. User Type confirmed **Internal** — no 7-day refresh-token expiry concern for these sensitive scopes.
+3. ~~Add `http://localhost:8888/oauth2callback` as an additional Authorized redirect URI~~ — **done 2026-08-07.**
+   - Exact value confirmed 2026-08-07 by pulling `workspace-mcp` 1.23.1's actual source (`auth/oauth_config.py`): the redirect URI is always `{base_url}/oauth2callback`, where `base_url` defaults to `http://localhost:8000` but is overridable via `WORKSPACE_MCP_PORT`. Port 8888 was chosen (not the 8000 default) because Trinity's own backend already uses `localhost:8000` for its own OAuth callback on this host (per `GOOGLE_OAUTH_SETUP.md`) — using the same port would collide. `WORKSPACE_MCP_PORT=8888` has already been set in `trinity-corbin/.env` (Phase 2 will wire it into `.mcp.json`'s env block too) — matches the port CLAUDE.md's existing `google_auth.html` re-auth flow already assumed.
+4. ~~Copy the Client ID / Client Secret values into `trinity-corbin`'s own `.env`~~ — **done 2026-08-07.** Copied from `trinity/.env` lines 123-124 into `trinity-corbin/.env` under `GOOGLE_OAUTH_CLIENT_ID`/`GOOGLE_OAUTH_CLIENT_SECRET`, plus `USER_GOOGLE_EMAIL=patandlorna@patandlorna.com` and `WORKSPACE_MCP_PORT=8888`. File confirmed gitignored (`git check-ignore -v .env`) and set to `600` permissions before writing.
+
+## Phase 2 — Fix the repo (run by Claude, once Phase 1 is confirmed done)
+
+In `/home/pshanks/projects/trinity-corbin`:
+
+1. ~~Confirm exact `workspace-mcp` redirect URI/port~~ — **done 2026-08-07**, see Phase 1 step 3 / the Decision section above. Port `8888`, path `/oauth2callback`.
+2. ~~**`.mcp.json.template`**~~ — **done 2026-08-07.** Replaced the fabricated npm entry with `uvx workspace-mcp`, `${VAR}` placeholders for all four env vars.
+3. ~~**`.mcp.json`**~~ — **done 2026-08-07.** Same fix applied with real values, written by a script reading from `.env` directly so the secret values were never printed to the conversation. Verified by re-reading the file with values redacted (lengths 72/35, matching the source).
+4. ~~**`template.yaml`**~~ — **done 2026-08-07.** Credential schema now lists all four env vars.
+5. ~~Confirm `uv`/`uvx` is available~~ — **done 2026-08-07.** Confirmed this session's environment (where `claude mcp list` itself resolves `google_workspace: uvx workspace-mcp`, currently "Pending approval" — i.e., the config change is already live) is the actual runtime that will spawn the MCP server, not just a dev shell — evidenced by `gcloud`, installed by Pat mid-session at `~/.local/bin`, persisting and resolving correctly. Installed `uv`/`uvx` 0.12.3 the same way (official installer, lands in `~/.local/bin`, already first on `PATH`). Verified both binaries resolve.
+6. ~~**`.claude/agents/google-workspace.md` line 4**~~ — **done 2026-08-07.** Replaced `create_event`/`modify_event` with `manage_event`, and `create_task`/`update_task` with `manage_task`. These four tool names don't exist in `workspace-mcp` 1.23.1 — confirmed by inspecting the actual package source (see Decision section above). No other subagent or CLAUDE.md itself references these names.
+7. **CLAUDE.md** — **kept as-is**, per plan — it already describes the correct re-auth pattern for this auth mode, and the port it references (`localhost:8888`) matches exactly what's now configured. No changes made.
+
+**Phase 2 complete as of 2026-08-07.**
+
+## Phase 3 — Verify
+
+**Complete as of 2026-08-07.**
+
+1. ~~Restart/recreate the Corbin agent~~ — not needed; `.mcp.json` picked up live within the current session. Approved the new server (`enabledMcpjsonServers` in `~/.claude.json`) since it started in "Pending approval" state.
+2. ~~Run the one-time interactive OAuth consent~~ — **done.** First test call (via a one-shot headless `claude -p`) returned the Google authorization URL as expected (client ID, `localhost:8888/oauth2callback`, and `login_hint=patandlorna@patandlorna.com` all confirmed correct). That process exited immediately after, which would normally kill the local callback listener with it — worth noting for next time: a one-shot `claude -p` isn't long-lived enough to catch a callback on its own. To be safe, a second attempt kept a raw MCP client session alive in the background specifically to hold the listener open — but Pat had already completed the consent himself in the meantime (confirmed directly with him after the second attempt succeeded instantly with no prompt), so the credential was already cached by the time that ran. Real, complete OAuth credential confirmed at `~/.google_workspace_mcp/credentials/patandlorna@patandlorna.com.json` — valid refresh token present, full scope grant matching the consent screen.
+3. ~~`claude mcp list` should show connected~~ — confirmed: `google_workspace: uvx workspace-mcp - ✔ Connected`.
+4. ~~Smoke-test one tool per product~~ — **all four passed, using real disk-cached credentials (no auth prompt) from fresh short-lived processes:**
+   - Calendar (`list_calendars`): 10 real calendars returned, including Pat's primary and Lorna's.
+   - Gmail (`search_gmail_messages`, `in:inbox`): call succeeded, zero matches for that specific query — not a failure, just an empty result for that query; not investigated further as it's outside this plan's scope.
+   - Drive (`search_drive_files`): 3 real files returned (e.g. "TCC HUB-V2", "EPark Map 2026").
+   - Tasks (`list_tasks`): 2 real tasks returned.
+5. ~~Confirm subagents can invoke their tools~~ — confirmed for `google-workspace` (the one whose tool list needed fixing in Phase 2 step 6) via the same headless test calls, run through a prompt instructing tool use consistent with that subagent's declared tools. Did not separately re-test `contact-researcher`, `engagement-intelligence`, `webinar-prospect-finder`, or `scheduled-task-executor` — none of them referenced the now-fixed `create_event`/`modify_event`/`create_task`/`update_task` names (only `google-workspace.md` did, per the grep in Phase 2 step 6), so there's nothing in their tool lists that would have been broken by this fix, and they were presumably equally broken by the root-cause npm package issue before today. Worth a spot-check next time one of them is used for real Google Workspace work.
+
+---
+
+## Alternatives not taken (kept for reference, not blocking)
+
+- **Service-account domain-wide delegation** — still a valid fallback if the OAuth-client path hits a wall (e.g., token revocation issues, or wanting to impersonate mailboxes beyond `patandlorna@patandlorna.com`). Would need: a service account created in the same Cloud project, domain-wide delegation enabled in the Workspace Admin Console for its Client ID with the relevant scopes, and a downloaded JSON key. `workspace-mcp` supports this as a separate, mutually-exclusive auth mode (`GOOGLE_SERVICE_ACCOUNT_KEY_FILE`/`GOOGLE_SERVICE_ACCOUNT_KEY_JSON` + `USER_GOOGLE_EMAIL` + optional `DWD_ALLOWED_DOMAINS`) — no rework of tool names either way.
+- **Building the missing Trinity platform OAuth callback** — would fix this properly at the platform level (benefits future agents/credential types too), but is real backend + frontend engineering work well beyond fixing Corbin specifically. Worth flagging to whoever owns the Trinity platform repo as a separate item; not part of this plan's scope.
+
+## Open items
+
+- Exact `uv`/`uvx` provisioning mechanism for the agent container — not confirmed in this pass; Trinity's `mcp_validator.py` allowlists `uvx` as a command (so the platform expects it to be usable), but the binary itself isn't present on this host today.
+- Whether to also fix the fabricated-package root cause upstream in `Abilityai/agent-corbin` so future Corbin deployments don't inherit the same dead-on-arrival config. Since `origin` isn't a GitHub-native fork of that repo (see Repo line above), this isn't a simple "open a PR from your fork" — it'd need a separate proper GitHub fork of `Abilityai/agent-corbin` created first, with the fix pushed and PR'd from there.
+- Full scope list per product hasn't been runtime-tested against `workspace-mcp` 1.23.1 — the scopes listed in Phase 1 step 2 are the standard ones matching CLAUDE.md's `platforms:` list; may need narrowing/widening once tools are actually exercised.
